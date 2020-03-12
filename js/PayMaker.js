@@ -89,11 +89,32 @@ export type PayMaker_Result_t = {
     lastSubmissions: { [string]: number },
     result: { [string]: number },
 };
+type AnnCompressorCredit_t = {
+    credit: number,
+    accepted: number,
+};
+type AnnCompressorSlot_t = {
+    time: number, // when this slot ends
+    eventId: string,
+    credits: { [string]: AnnCompressorCredit_t },
+    eventIds: { [string]: bool } | null
+};
+type AnnCompressor_t = BinTree_t<AnnCompressorSlot_t> & {
+    timespanMs: number,
+    slotsToKeepEvents: number,
+    insertWarn: (AnnsEvent_t, (any)=>void) => void,
+    anns: BinTree_t<AnnCompressorSlot_t>,
+};
+type AnnCompressorConfig_t = {
+    timespanMs: number,
+    slotsToKeepEvents: number,
+};
 export type PayMaker_Config_t = {
     url: string,
     port: number,
     updateCycle: number,
     historyDepth: number,
+    annCompressor: AnnCompressorConfig_t,
     blockPayoutFraction: number,
     pplnsAnnConstantX: number,
     pplnsBlkConstantX: number,
@@ -107,7 +128,7 @@ type Context_t = {
     workdir: string,
     rpcClient: Rpc_Client_t,
     blocks: BinTree_t<Protocol_BlockEvent_t>,
-    anns: BinTree_t<AnnsEvent_t>,
+    annCompressor: AnnCompressor_t,
     shares: BinTree_t<ShareEvent_t>,
     oes: typeof _flow_typeof_saferphore,
     startTime: number,
@@ -183,7 +204,7 @@ const onAnns = (ctx, elem /*:AnnsEvent_t*/, warn) => {
             // console.log("ann payable work:", getPayableAnnWork(elem));
             // console.log("difficulty:", diff);
         }
-        ctx.anns.insert(elem);
+        ctx.annCompressor.insertWarn(elem, warn);
     }
 };
 
@@ -253,7 +274,7 @@ const handleEvents = (ctx, fileName, dataStr) => {
 const garbageCollect = (ctx) => {
     const evt = earliestValidTime(ctx);
     const b = ctx.blocks.gcOld(evt);
-    const a = ctx.anns.gcOld(evt);
+    const a = ctx.annCompressor.gcOld(evt);
     const s = ctx.shares.gcOld(evt);
     console.error(`Garbage collected [blocks:${b} anns:${a} shares:${s}]`);
 };
@@ -287,7 +308,7 @@ const getNewestTimestamp = (dataStr) => {
 };
 
 const stats = (ctx) => {
-  return 'anns:' + ctx.anns.size() +
+  return 'annSlots:' + ctx.annCompressor.size() +
   ' shares:' + ctx.shares.size() +
   ' blocks:' + ctx.blocks.size();
 };
@@ -410,18 +431,22 @@ const computeWhoToPay = (ctx /*:Context_t*/, maxtime) => {
     remaining = 1 - ctx.mut.cfg.blockPayoutFraction;
     let earliestAnnPayout = Infinity;
     const payoutAnns = {};
-    ctx.anns.reach((a) => {
+    ctx.annCompressor.reach((a) => {
         if (a.time > maxtime) { return; }
         // console.error('ann');
-        if (a.credit === null) { return false; }
-        earliestAnnPayout = a.time;
-        let toPay = a.credit / ctx.mut.cfg.pplnsAnnConstantX;
-        if (toPay >= remaining) { toPay = remaining; }
-        if (!mostRecentlySeen[a.payTo]) { mostRecentlySeen[a.payTo] = a.time; }
-        payoutAnns[a.payTo] = (payoutAnns[a.payTo] || 0) + a.accepted;
-        payouts[a.payTo] = (payouts[a.payTo] || 0) + toPay;
-        remaining -= toPay;
-        if (remaining === 0) { return false; }
+        const addresses = Object.keys(a.credits);
+        for (const payTo of addresses) {
+            const credit = a.credits[payTo];
+            if (credit.credit === 0) { return; }
+            earliestAnnPayout = a.time;
+            let toPay = credit.credit / ctx.mut.cfg.pplnsAnnConstantX;
+            if (toPay >= remaining) { toPay = remaining; }
+            if (!mostRecentlySeen[payTo]) { mostRecentlySeen[payTo] = a.time; }
+            payoutAnns[payTo] = (payoutAnns[payTo] || 0) + credit.accepted;
+            payouts[payTo] = (payouts[payTo] || 0) + toPay;
+            remaining -= toPay;
+            if (remaining === 0) { return false; }
+        }
     });
     if (remaining) {
         warn.push("Ran out of ann shares to pay paying [" + (remaining * 100) + "%] to " +
@@ -433,7 +458,7 @@ const computeWhoToPay = (ctx /*:Context_t*/, maxtime) => {
     let latestPayout = (()=>{
         const m = ctx.shares.max();
         const t0 = m ? m.time : 0;
-        const a = ctx.anns.max();
+        const a = ctx.annCompressor.max();
         const t1 = a ? a.time : 0;
         return Math.max(t0, t1);
     })();
@@ -520,7 +545,7 @@ const onStats = (ctx /*:Context_t*/, req, res) => {
     if (Util.badMethod('GET', req, res)) { return; }
     res.end(JSON.stringify({
         blocks: ctx.blocks.size(),
-        anns: ctx.anns.size(),
+        compressedAnnBlocks: ctx.annCompressor.size(),
         shares: ctx.shares.size(),
         memory: process.memoryUsage(),
     }, null, '\t'));
@@ -646,15 +671,82 @@ const mkTree = /*::<X:{time:number,eventId:string}>*/() /*:BinTree_t<X>*/ => {
             }
             return oldSize - tree.size;
         },
-        has: (x /*:X*/) => {
-            return x.eventId in dedup;
-        },
         each: (x) => tree.each(x),
         reach: (x) => tree.reach(x),
         min: () => tree.min(),
         max: () => tree.max(),
         size: () => tree.size,
     });
+};
+
+const mkCompressor = (cfg /*:AnnCompressorConfig_t*/) /*AnnCompressor_t*/ => {
+    const tree = mkTree/*::<AnnCompressorSlot_t>*/();
+    const cctx = Object.freeze({
+        timespanMs: cfg.timespanMs,
+        slotsToKeepEvents: cfg.slotsToKeepEvents,
+        anns: tree,
+        insertWarn: (ann /*:AnnsEvent_t*/, warn) => {
+            let newerDs;
+            cctx.anns.reach((ds) => {
+                // Keep searching back
+                if (ann.time < ds.time) {
+                    newerDs = ds;
+                    return;
+                }
+                if (!newerDs) {
+                    // Newer than anything, create a new block
+                    newerDs = {
+                        time: ds.time + cctx.timespanMs,
+                        eventId: 'COMPRESSED_EVENTS_' + ds.time + cctx.timespanMs,
+                        credits: { },
+                        eventIds: { }
+                    }
+                    cctx.anns.insert(newerDs);
+                    return false;
+                }
+                // found the correct slot
+                return false;
+            });
+            if (!newerDs) {
+                // empty tree or just a single entry in the tree
+                const t = ann.time - (ann.time % cctx.timespanMs);
+                newerDs = {
+                    time: t,
+                    eventId: 'COMPRESSED_EVENTS_' + String(t),
+                    credits: { },
+                    eventIds: { }
+                };
+            }
+            if (ann.time < newerDs.time) {
+                warn("Unable to add ann, no compressor entry old enough");
+            } else if (newerDs.eventIds === null) {
+                // this event has had it's event id block garbage collected
+                warn("Unable to add ann, compressor entry dedup table was pruned");
+            } else {
+                newerDs.eventIds[ann.eventId] = true;
+                newerDs.credits[ann.payTo] = (newerDs.credits[ann.payTo] || 0) + ann.credit;
+            }
+        },
+        gcOld: (earliestValidTime) => {
+            const last = cctx.anns.max();
+            if (!last) { return; }
+            const oldestEventsTime = last.time - (cctx.timespanMs * cctx.slotsToKeepEvents);
+            const ret = cctx.anns.gcOld(earliestValidTime);
+            cctx.anns.reach((slot) => {
+                if (slot.time > oldestEventsTime) { return; }
+                if (slot.eventIds === null) { return false; }
+                slot.eventIds = null;
+            });
+            return ret;
+        },
+        insert: (ann /*:AnnsEvent_t*/) => cctx.insertWarn(ann, (_)=>{}),
+        each: (x) => tree.each(x),
+        reach: (x) => tree.reach(x),
+        min: () => tree.min(),
+        max: () => tree.max(),
+        size: () => tree.size
+    });
+    return cctx;
 };
 
 module.exports.create = (cfg /*:PayMaker_Config_t*/) => {
@@ -675,7 +767,7 @@ module.exports.create = (cfg /*:PayMaker_Config_t*/) => {
             workdir: workdir,
             rpcClient: Rpc.create(cfg.root.rpc),
             blocks: mkTree/*::<Protocol_BlockEvent_t>*/(),
-            anns: mkTree/*::<AnnsEvent_t>*/(),
+            annCompressor: mkCompressor(cfg.annCompressor),
             shares: mkTree/*::<ShareEvent_t>*/(),
             oes: Saferphore.create(1),
             startTime: +new Date(),
