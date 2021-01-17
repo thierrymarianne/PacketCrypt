@@ -71,6 +71,23 @@ Make sure you have [homebrew](https://brew.sh/) installed first, then:
     make
     npm install
 
+## Dockerfile
+
+```shell
+# Build Docker image from Dockerfile
+(cd docs && make build)
+
+# Start mining blocks
+( export MINING_POOL='http://pool.pkteer.com' WALLET_ADDRESS='your_address' && \
+cd docs && make start-mining )
+
+# Tail logs
+( cd docs && make tail-logs )
+
+# Stop mining
+( cd docs && make stop-mining )
+```
+
 ## Mining
 
 Once you've built the relevant code, you can begin mining *announcements* in the
